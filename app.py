@@ -10,7 +10,7 @@ st.set_page_config(page_title="Electrochemistry Calculator", layout="wide")
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.8rem; padding-bottom: 2rem; max-width: 1350px; }
+    .block-container { padding-top: 1.8rem; padding-bottom: 2rem; max-width: 1300px; }
     div[data-testid="stMetric"] {
         background-color: rgba(128, 128, 128, 0.05);
         border: 1px solid rgba(128, 128, 128, 0.18);
@@ -25,9 +25,6 @@ st.markdown(
 )
 
 
-# ==========================================
-# DATA HELPERS
-# ==========================================
 @st.cache_data(show_spinner=False)
 def get_sheets(file_bytes, file_name):
     if file_name.lower().endswith((".xlsx", ".xls")):
@@ -73,20 +70,14 @@ def get_rs(df, col_f, col_zr, col_zi, mode):
     return float(row[col_zr]), row
 
 
-def calc_lsv(df, col_v, col_i, i_unit, rxn, rhe_off, rs, ir_frac, area, zero_base):
+def calc_lsv(df, col_v, col_i, i_unit, rxn, rhe_off, rs, ir_frac, area):
     out = pd.DataFrame()
     out["Potential (V)"] = pd.to_numeric(df[col_v], errors="coerce")
     raw_i = pd.to_numeric(df[col_i], errors="coerce")
     out["Current (A)"] = raw_i / 1000.0 if i_unit == "mA" else raw_i
     out = out.dropna().reset_index(drop=True)
 
-    if zero_base and not out.empty:
-        n_pts = max(3, int(len(out) * 0.05))
-        out["Current_Corr (A)"] = out["Current (A)"] - out["Current (A)"].iloc[:n_pts].mean()
-    else:
-        out["Current_Corr (A)"] = out["Current (A)"]
-
-    out["j (mA/cm²)"] = (out["Current_Corr (A)"] * 1000.0) / area
+    out["j (mA/cm²)"] = (out["Current (A)"] * 1000.0) / area
     out["|j| (mA/cm²)"] = out["j (mA/cm²)"].abs()
     out["E_RHE Raw (V)"] = out["Potential (V)"] + rhe_off
     out["iR Drop (V)"] = out["Current (A)"] * rs * ir_frac
@@ -105,19 +96,34 @@ def calc_lsv(df, col_v, col_i, i_unit, rxn, rhe_off, rs, ir_frac, area, zero_bas
     return out
 
 
-def get_eta(df, target_j, col="η (mV)"):
-    sub = df[["|j| (mA/cm²)", col]].dropna()
-    if sub.empty or sub["|j| (mA/cm²)"].max() < target_j:
-        return np.nan
-    jv = sub["|j| (mA/cm²)"].values
-    ev = sub[col].values
+def get_eta10(df, eta_col="η (mV)", e_col="E_RHE (V)"):
+    """
+    Finds overpotential at 10 mA/cm² on the rising catalytic branch only,
+    ignoring any initial potentiostat settling spike on the left.
+    """
+    sub = df[["|j| (mA/cm²)", eta_col, e_col]].dropna().reset_index(drop=True)
+    if sub.empty:
+        return np.nan, np.nan
+
+    # Start searching only after the baseline minimum current density
+    min_idx = int(sub["|j| (mA/cm²)"].idxmin())
+    rising_branch = sub.iloc[min_idx:].reset_index(drop=True)
+
+    jv = rising_branch["|j| (mA/cm²)"].values
+    ev = rising_branch[eta_col].values
+    vv = rising_branch[e_col].values
+
     for k in range(len(jv) - 1):
-        if (jv[k] <= target_j <= jv[k + 1]) or (jv[k + 1] <= target_j <= jv[k]):
+        # Require rising current density crossing 10 mA/cm² and positive overpotential
+        if jv[k] <= 10.0 <= jv[k + 1] and ev[k + 1] > 0:
             if abs(jv[k + 1] - jv[k]) < 1e-9:
-                return float(ev[k])
-            w = (target_j - jv[k]) / (jv[k + 1] - jv[k])
-            return float(ev[k] + w * (ev[k + 1] - ev[k]))
-    return np.nan
+                return float(ev[k]), float(vv[k])
+            w = (10.0 - jv[k]) / (jv[k + 1] - jv[k])
+            eta_10 = float(ev[k] + w * (ev[k + 1] - ev[k]))
+            v_10 = float(vv[k] + w * (vv[k + 1] - vv[k]))
+            return eta_10, v_10
+
+    return np.nan, np.nan
 
 
 # ==========================================
@@ -144,7 +150,6 @@ with st.sidebar:
     st.subheader("Resistance (Rs)")
     rs_mode = st.selectbox("Rs Source", ["100 kHz", "Min |Z''|", "Manual"])
     manual_rs = st.number_input("Manual Rs (Ω)", 0.0, 5000.0, 9.60, 0.1)
-    zero_base = st.checkbox("Zero initial baseline current", value=False)
 
     rhe_offset = e_ref + 0.059 * pH
     st.caption(f"RHE offset: +{rhe_offset:.4f} V")
@@ -239,10 +244,15 @@ def render_rxn(uploaded_file, rxn):
         with m4:
             iu = st.selectbox("Unit", ["A", "mA"], index=0, key=f"iu_{rxn}")
 
-    df_proc = calc_lsv(df_raw, cv, ci, iu, rxn, rhe_offset, active_rs, ir_frac, area_cm2, zero_base)
+    df_proc = calc_lsv(df_raw, cv, ci, iu, rxn, rhe_offset, active_rs, ir_frac, area_cm2)
 
-    # Tafel Range & Fit
-    tf_data = df_proc.dropna(subset=["log|j|", "η (mV)"])
+    # Extract η10 on rising catalytic branch only
+    eta10, v10 = get_eta10(df_proc, "η (mV)", "E_RHE (V)")
+    eta10_raw, _ = get_eta10(df_proc, "η Raw (mV)", "E_RHE Raw (V)")
+
+    # Slice rising catalytic branch with η > 0 for Tafel fitting
+    min_idx = int(df_proc["|j| (mA/cm²)"].idxmin())
+    tf_data = df_proc.iloc[min_idx:].dropna(subset=["log|j|", "η (mV)"])
     tf_data = tf_data[tf_data["η (mV)"] > 0]
 
     j_min = float(max(0.5, tf_data["|j| (mA/cm²)"].min())) if len(tf_data) >= 5 else 1.0
@@ -250,18 +260,11 @@ def render_rxn(uploaded_file, rxn):
     d_low = min(max(5.0, j_min), j_max * 0.5)
     d_high = min(max(30.0, d_low + 10.0), j_max)
 
-    # Top Metrics Row
-    targets = [10, 20, 30, 50, 100]
-    etas = {t: get_eta(df_proc, t, "η (mV)") for t in targets}
-    etas_raw = {t: get_eta(df_proc, t, "η Raw (mV)") for t in targets}
+    cols = st.columns(4)
+    cols[0].metric("η10", f"{eta10:.1f} mV" if not np.isnan(eta10) else "—")
+    cols[1].metric("E @ 10 mA/cm²", f"{v10:.3f} V" if not np.isnan(v10) else "—")
+    cols[2].metric("Rs", f"{active_rs:.2f} Ω")
 
-    cols = st.columns(7)
-    for idx, t in enumerate(targets):
-        val = etas[t]
-        cols[idx].metric(f"η{t}", f"{val:.1f} mV" if not np.isnan(val) else "—")
-    cols[5].metric("Rs", f"{active_rs:.2f} Ω")
-
-    # Plots + Tafel Slider
     p1, p2 = st.columns(2)
 
     with p2:
@@ -279,7 +282,7 @@ def render_rxn(uploaded_file, rxn):
         reg = linregress(fit_sub["log|j|"], fit_sub["η (mV)"])
         slope, r2 = reg.slope, reg.rvalue ** 2
 
-    cols[6].metric("Tafel Slope", f"{slope:.1f} mV/dec" if not np.isnan(slope) else "—")
+    cols[3].metric("Tafel Slope", f"{slope:.1f} mV/dec" if not np.isnan(slope) else "—")
 
     with p1:
         fig_lsv = go.Figure()
@@ -301,6 +304,17 @@ def render_rxn(uploaded_file, rxn):
                 line=dict(color="#111827", width=2.5),
             )
         )
+        if not np.isnan(v10):
+            j_target_signed = -10.0 if rxn == "HER" else 10.0
+            fig_lsv.add_trace(
+                go.Scatter(
+                    x=[v10],
+                    y=[j_target_signed],
+                    mode="markers",
+                    marker=dict(size=10, color="#dc2626"),
+                    name=f"η10 = {eta10:.1f} mV",
+                )
+            )
         fig_lsv.update_layout(
             template="plotly_white",
             title="LSV Curve",
@@ -353,15 +367,11 @@ def render_rxn(uploaded_file, rxn):
         "iR (%)": ir_pct,
         "pH": pH,
         "Area (cm²)": area_cm2,
-        "η10 (mV)": etas[10],
-        "η20 (mV)": etas[20],
-        "η30 (mV)": etas[30],
-        "η50 (mV)": etas[50],
-        "η100 (mV)": etas[100],
-        "η10 Raw (mV)": etas_raw[10],
-        "η50 Raw (mV)": etas_raw[50],
-        "Tafel (mV/dec)": slope,
-        "R²": r2,
+        "E @ 10 mA/cm² (V vs RHE)": v10,
+        "η10 (mV)": eta10,
+        "η10 Raw (mV)": eta10_raw,
+        "Tafel Slope (mV/dec)": slope,
+        "Tafel R²": r2,
     }
     return df_proc, summary
 
