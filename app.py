@@ -6,18 +6,41 @@ from scipy.stats import linregress
 import streamlit as st
 
 # ==========================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & CUSTOM UI STYLING
 # ==========================================
 st.set_page_config(
-    page_title="HER & OER Overpotential Calculator",
+    page_title="HER & OER Overpotential Analyzer",
     page_icon="⚡",
     layout="wide",
 )
 
+# Custom CSS for bordered metric cards, clean tabs, and polished headers
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetric"] {
+        background-color: rgba(128, 128, 128, 0.06);
+        border: 1px solid rgba(128, 128, 128, 0.2);
+        border-radius: 10px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    div[data-testid="stFileUploader"] {
+        border-radius: 10px;
+    }
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("⚡ Automated HER & OER Overpotential & EIS Analyzer")
 st.caption(
-    "Pre-configured for Metrohm Autolab NOVA exports & template workbooks | "
-    "Supports automated 100 kHz EIS Rs extraction, iR compensation, Nickel Foam baseline correction, and Tafel analysis."
+    "Metrohm Autolab NOVA & Excel Template Processor • 100 kHz EIS Rs Extraction • "
+    "90% iR Compensation • Nickel Foam Capacitive Baseline Diagnostics"
 )
 
 # ==========================================
@@ -53,9 +76,9 @@ with st.sidebar:
 
     rhe_offset = e_ref + (0.059 * pH)
     st.info(
-        f"**RHE Conversion Equation:**\n\n"
+        f"**RHE Conversion:**\n\n"
         f"$E_{{\\text{{RHE}}}} = E_{{\\text{{meas}}}} + {e_ref:.3f} + 0.059({pH:.1f})$\n\n"
-        f"**Total Offset:** `+{rhe_offset:.4f} V`"
+        f"**Offset:** `+{rhe_offset:.4f} V`"
     )
 
     st.divider()
@@ -77,33 +100,38 @@ with st.sidebar:
     apply_baseline = st.checkbox(
         "Apply Capacitive Pre-Current Baseline Zeroing",
         value=False,
-        help="Subtracts non-Faradaic capacitive pre-current offset on high-surface-area Nickel Foam before evaluating overpotentials."
+        help="Subtracts non-Faradaic capacitive pre-current offset on high-surface-area Nickel Foam."
     )
 
 
 # ==========================================
-# HELPER FUNCTIONS
+# CACHED HELPER FUNCTIONS
 # ==========================================
-def load_uploaded_file(uploaded_file, sheet_name=None):
-    """Reads CSV, TXT, or Excel file into a DataFrame."""
-    name = uploaded_file.name.lower()
+@st.cache_data(show_spinner=False)
+def get_sheet_names(file_bytes, file_name):
+    if file_name.lower().endswith((".xlsx", ".xls")):
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        return xls.sheet_names
+    return ["Sheet1"]
+
+
+@st.cache_data(show_spinner=False)
+def load_dataframe(file_bytes, file_name, sheet_name=None):
+    name = file_name.lower()
+    buf = io.BytesIO(file_bytes)
     if name.endswith((".xlsx", ".xls")):
-        xls = pd.ExcelFile(uploaded_file)
-        target_sheet = sheet_name if sheet_name in xls.sheet_names else xls.sheet_names[0]
-        df = pd.read_excel(xls, sheet_name=target_sheet)
-        return df, xls.sheet_names
+        xls = pd.ExcelFile(buf)
+        target = sheet_name if sheet_name in xls.sheet_names else xls.sheet_names[0]
+        return pd.read_excel(xls, sheet_name=target)
     else:
-        uploaded_file.seek(0)
         try:
-            df = pd.read_csv(uploaded_file, sep=None, engine="python")
+            return pd.read_csv(buf, sep=None, engine="python")
         except Exception:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file)
-        return df, ["Sheet1"]
+            buf.seek(0)
+            return pd.read_csv(buf)
 
 
 def detect_column(df, keywords, fallback_idx=0):
-    """Finds the best matching column name based on priority keywords."""
     cols = list(df.columns)
     for kw in keywords:
         for c in cols:
@@ -113,22 +141,17 @@ def detect_column(df, keywords, fallback_idx=0):
 
 
 def extract_rs_from_eis(df, col_freq, col_z_real, col_z_imag, method):
-    """Extracts solution resistance Rs (Ohms) from EIS DataFrame."""
     work = df[[col_freq, col_z_real, col_z_imag]].apply(pd.to_numeric, errors="coerce").dropna()
     if work.empty:
         return None, None
-
     if "100 kHz" in method:
-        # Find row closest to 100,000 Hz
         idx = (work[col_freq] - 100000.0).abs().idxmin()
     else:
-        # Filter to high-frequency half and find minimum |Z''|
         high_freq_cut = work[col_freq].median()
         hf_sub = work[work[col_freq] >= high_freq_cut]
         if hf_sub.empty:
             hf_sub = work
         idx = hf_sub[col_z_imag].abs().idxmin()
-
     row = work.loc[idx]
     return float(row[col_z_real]), row
 
@@ -137,75 +160,46 @@ def process_lsv_data(
     df, col_pot, col_curr, curr_unit, reaction_type,
     rhe_offset_val, rs_ohm, ir_comp_frac, area, zero_baseline=False
 ):
-    """
-    Processes raw LSV data into RHE potentials, iR-corrected potentials,
-    current density (mA/cm²), overpotential η (mV), and log10(|j|).
-    """
     work = pd.DataFrame()
     work["WE(1).Potential (V)"] = pd.to_numeric(df[col_pot], errors="coerce")
     raw_curr = pd.to_numeric(df[col_curr], errors="coerce")
-
-    # Convert current to Amperes if uploaded in mA
-    if curr_unit == "mA":
-        work["WE(1).Current (A)"] = raw_curr / 1000.0
-    else:
-        work["WE(1).Current (A)"] = raw_curr
-
+    work["WE(1).Current (A)"] = raw_curr / 1000.0 if curr_unit == "mA" else raw_curr
     work = work.dropna().reset_index(drop=True)
 
-    # Optional capacitive pre-current baseline subtraction
     baseline_offset_a = 0.0
     if zero_baseline and not work.empty:
-        # Estimate non-Faradaic baseline from the initial 5% of the sweep
         n_init = max(3, int(len(work) * 0.05))
         baseline_offset_a = work["WE(1).Current (A)"].iloc[:n_init].mean()
         work["Current_Corrected (A)"] = work["WE(1).Current (A)"] - baseline_offset_a
     else:
         work["Current_Corrected (A)"] = work["WE(1).Current (A)"]
 
-    # Current density in mA/cm²
     work["Current Density j (mA/cm²)"] = (work["Current_Corrected (A)"] * 1000.0) / area
     work["|j| (mA/cm²)"] = work["Current Density j (mA/cm²)"].abs()
-
-    # Potential vs. RHE (Uncorrected)
     work["E vs RHE Raw (V)"] = work["WE(1).Potential (V)"] + rhe_offset_val
-
-    # iR Drop (V) = I (A) * Rs (Ohm) * compensation fraction
-    # Using signed current in Amperes automatically shifts both anodic (OER, I > 0)
-    # and cathodic (HER, I < 0) potentials toward the thermodynamic potential.
     work["iR Drop (V)"] = work["WE(1).Current (A)"] * rs_ohm * ir_comp_frac
     work["E vs RHE iR-Corrected (V)"] = work["E vs RHE Raw (V)"] - work["iR Drop (V)"]
 
-    # Overpotential η (mV)
     if reaction_type == "HER":
-        # HER thermodynamic potential = 0.00 V vs RHE
         work["Overpotential η Raw (mV)"] = (-work["E vs RHE Raw (V)"]) * 1000.0
         work["Overpotential η (mV)"] = (-work["E vs RHE iR-Corrected (V)"]) * 1000.0
     else:
-        # OER thermodynamic potential = 1.23 V vs RHE
         work["Overpotential η Raw (mV)"] = (work["E vs RHE Raw (V)"] - 1.23) * 1000.0
         work["Overpotential η (mV)"] = (work["E vs RHE iR-Corrected (V)"] - 1.23) * 1000.0
 
-    # Log10(|j|) for Tafel Plot
     work["log10(|j| [mA/cm²])"] = np.where(
         work["|j| (mA/cm²)"] > 1e-6, np.log10(work["|j| (mA/cm²)"].clip(lower=1e-6)), np.nan
     )
-
     return work, baseline_offset_a
 
 
 def interpolate_eta_at_j(df_proc, target_j, use_ir_corrected=True):
-    """Finds overpotential η (mV) at a specific current density |j| (mA/cm²) via linear interpolation."""
     eta_col = "Overpotential η (mV)" if use_ir_corrected else "Overpotential η Raw (mV)"
     sub = df_proc[["|j| (mA/cm²)", eta_col]].dropna()
     if sub.empty or sub["|j| (mA/cm²)"].max() < target_j:
         return np.nan
-
-    # Sort by current density along the active catalytic branch
-    # Find the point where |j| crosses target_j
     j_vals = sub["|j| (mA/cm²)"].values
     eta_vals = sub[eta_col].values
-
     for idx in range(len(j_vals) - 1):
         j1, j2 = j_vals[idx], j_vals[idx + 1]
         if (j1 <= target_j <= j2) or (j2 <= target_j <= j1):
@@ -213,7 +207,6 @@ def interpolate_eta_at_j(df_proc, target_j, use_ir_corrected=True):
                 return float(eta_vals[idx])
             weight = (target_j - j1) / (j2 - j1)
             return float(eta_vals[idx] + weight * (eta_vals[idx + 1] - eta_vals[idx]))
-
     return np.nan
 
 
@@ -224,11 +217,12 @@ st.subheader("1. Upload Raw Potentiostat Files (.xlsx, .csv, .txt)")
 col_up1, col_up2, col_up3 = st.columns(3)
 
 with col_up1:
-    eis_file = st.file_uploader("Upload EIS Data (e.g., EIS.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
+    eis_file = st.file_uploader("Upload EIS Data (EIS.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
 with col_up2:
-    her_file = st.file_uploader("Upload LSV HER Data (e.g., LSV HER.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
+    her_file = st.file_uploader("Upload LSV HER Data (LSV HER.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
 with col_up3:
-    oer_file = st.file_uploader("Upload LSV OER Data (e.g., LSV OER.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
+    oer_file = st.file_uploader("Upload LSV OER Data (LSV OER.xlsx / .csv)", type=["xlsx", "xls", "csv", "txt"])
+
 
 # ==========================================
 # STEP 2: EIS PROCESSING & Rs EXTRACTION
@@ -239,13 +233,14 @@ eis_df_clean = None
 if eis_file is not None:
     st.divider()
     st.subheader("2. EIS Analysis & Solution Resistance ($R_s$)")
-    eis_raw, eis_sheets = load_uploaded_file(eis_file)
+    eis_bytes = eis_file.getvalue()
+    eis_sheets = get_sheet_names(eis_bytes, eis_file.name)
 
     c_s1, c_s2, c_s3, c_s4 = st.columns(4)
     with c_s1:
-        if len(eis_sheets) > 1:
-            sel_eis_sheet = st.selectbox("EIS Sheet", eis_sheets)
-            eis_raw, _ = load_uploaded_file(eis_file, sel_eis_sheet)
+        sel_eis_sheet = st.selectbox("EIS Sheet", eis_sheets) if len(eis_sheets) > 1 else eis_sheets[0]
+    eis_raw = load_dataframe(eis_bytes, eis_file.name, sel_eis_sheet)
+
     with c_s2:
         col_freq = st.selectbox(
             "Frequency Column (Hz)",
@@ -269,20 +264,16 @@ if eis_file is not None:
     if extracted_rs is not None and rs_method != "Manual Rs Input":
         active_rs = extracted_rs
 
-    col_eis_metrics, col_eis_plot = st.columns([1, 2])
+    col_eis_metrics, col_eis_plot = st.columns([1, 2.2])
     with col_eis_metrics:
-        st.metric("Active Solution Resistance (Rs)", f"{active_rs:.2f} Ω")
+        st.metric("Extracted Solution Resistance (Rs)", f"{active_rs:.2f} Ω")
         if rs_row is not None:
-            st.write(f"**Extracted at Frequency:** `{rs_row[col_freq]:,.1f} Hz`")
-            st.write(f"**Z' (Real):** `{rs_row[col_zr]:.3f} Ω`")
-            st.write(f"**Z'' (Imag):** `{rs_row[col_zi]:.3f} Ω`")
-        st.caption(
-            f"Applying **{ir_comp_pct}% iR compensation** ($R_{{comp}} = {active_rs * ir_factor:.2f}\\ \\Omega$)."
-        )
+            st.metric("Intercept Frequency", f"{rs_row[col_freq]:,.0f} Hz")
+            st.caption(f"**Z':** `{rs_row[col_zr]:.3f} Ω` | **Z'':** `{rs_row[col_zi]:.3f} Ω`")
+        st.success(f"**Effective iR Resistance ({ir_comp_pct}%):** `{active_rs * ir_factor:.2f} Ω`")
 
     with col_eis_plot:
         eis_df_clean = eis_raw[[col_freq, col_zr, col_zi]].apply(pd.to_numeric, errors="coerce").dropna()
-        # Plot -Z'' on y-axis (flip sign if raw column is negative Z'')
         y_vals = -eis_df_clean[col_zi] if eis_df_clean[col_zi].mean() < 0 else eis_df_clean[col_zi]
         fig_eis = go.Figure()
         fig_eis.add_trace(
@@ -290,7 +281,8 @@ if eis_file is not None:
                 x=eis_df_clean[col_zr],
                 y=y_vals,
                 mode="lines+markers",
-                name="Nyquist Plot",
+                name="Nyquist Curve",
+                line=dict(color="#2563eb", width=2),
             )
         )
         if rs_row is not None:
@@ -300,40 +292,157 @@ if eis_file is not None:
                     x=[rs_row[col_zr]],
                     y=[y_pt],
                     mode="markers",
-                    marker=dict(size=12, color="red", symbol="x"),
+                    marker=dict(size=13, color="#dc2626", symbol="x"),
                     name=f"Rs = {active_rs:.2f} Ω (@ {rs_row[col_freq]:.0f} Hz)",
                 )
             )
         fig_eis.update_layout(
+            template="plotly_white",
             title="EIS Nyquist Plot & High-Frequency Rs Intercept",
             xaxis_title="Z' (Ω)",
             yaxis_title="-Z'' (Ω)",
-            height=340,
+            height=330,
             margin=dict(l=20, r=20, t=40, b=20),
         )
         st.plotly_chart(fig_eis, use_container_width=True)
 else:
-    st.info(
-        f"💡 No EIS file uploaded yet. Using fallback/manual **$R_s = {active_rs:.2f}\\ \\Omega$** from the sidebar."
-    )
+    st.info(f"💡 No EIS file uploaded yet. Using fallback/manual **$R_s = {active_rs:.2f}\\ \\Omega$** from the sidebar.")
 
 
 # ==========================================
-# STEP 3: LSV HER & OER PROCESSING FUNCTION
+# FRAGMENT FOR ZERO-LAG TAFEL & PLOTTING
+# ==========================================
+@st.fragment
+def render_interactive_plots(df_proc, reaction_label, ir_comp_pct_val):
+    valid_tafel = df_proc.dropna(subset=["log10(|j| [mA/cm²])", "Overpotential η (mV)"])
+    valid_tafel = valid_tafel[valid_tafel["Overpotential η (mV)"] > 0]
+
+    col_t1, col_t2 = st.columns([1, 2.2])
+    tafel_slope = np.nan
+    tafel_r2 = np.nan
+
+    with col_t1:
+        st.markdown(f"##### 🎯 {reaction_label} Tafel Linear Fit")
+        if len(valid_tafel) >= 5:
+            j_min_avail = float(max(0.5, valid_tafel["|j| (mA/cm²)"].min()))
+            j_max_avail = float(valid_tafel["|j| (mA/cm²)"].max())
+            default_low = min(max(5.0, j_min_avail), j_max_avail * 0.5)
+            default_high = min(max(30.0, default_low + 10.0), j_max_avail)
+
+            j_range = st.slider(
+                f"Linear Window |j| (mA/cm²)",
+                min_value=round(j_min_avail, 2),
+                max_value=round(j_max_avail, 2),
+                value=(round(default_low, 2), round(default_high, 2)),
+                key=f"tafel_slider_{reaction_label}",
+            )
+
+            fit_sub = valid_tafel[
+                (valid_tafel["|j| (mA/cm²)"] >= j_range[0])
+                & (valid_tafel["|j| (mA/cm²)"] <= j_range[1])
+            ]
+
+            if len(fit_sub) >= 3:
+                res = linregress(fit_sub["log10(|j| [mA/cm²])"], fit_sub["Overpotential η (mV)"])
+                tafel_slope = res.slope
+                tafel_r2 = res.rvalue ** 2
+                st.metric(f"{reaction_label} Tafel Slope", f"{tafel_slope:.1f} mV/dec")
+                st.metric("Linear Fit R²", f"{tafel_r2:.5f}")
+            else:
+                st.warning("Select a wider current density window (≥ 3 points).")
+
+    with col_t2:
+        tab_lsv, tab_tafel, tab_table = st.tabs(
+            ["📈 LSV Polarization Curve", "📐 Tafel Plot (η vs. log|j|)", "📋 Processed Data Table"]
+        )
+
+        with tab_lsv:
+            fig_lsv = go.Figure()
+            fig_lsv.add_trace(
+                go.Scatter(
+                    x=df_proc["E vs RHE Raw (V)"],
+                    y=df_proc["Current Density j (mA/cm²)"],
+                    mode="lines",
+                    name="Raw (0% iR)",
+                    line=dict(color="#94a3b8", dash="dash", width=2),
+                )
+            )
+            fig_lsv.add_trace(
+                go.Scatter(
+                    x=df_proc["E vs RHE iR-Corrected (V)"],
+                    y=df_proc["Current Density j (mA/cm²)"],
+                    mode="lines",
+                    name=f"{ir_comp_pct_val}% iR-Corrected",
+                    line=dict(color="#0f766e" if reaction_label == "HER" else "#b91c1c", width=3),
+                )
+            )
+            fig_lsv.update_layout(
+                template="plotly_white",
+                xaxis_title="Potential (V vs. RHE)",
+                yaxis_title="Current Density j (mA/cm²)",
+                height=360,
+                margin=dict(l=20, r=20, t=30, b=20),
+            )
+            st.plotly_chart(fig_lsv, use_container_width=True)
+
+        with tab_tafel:
+            fig_tf = go.Figure()
+            fig_tf.add_trace(
+                go.Scatter(
+                    x=valid_tafel["log10(|j| [mA/cm²])"],
+                    y=valid_tafel["Overpotential η (mV)"],
+                    mode="markers",
+                    name="Experimental Data",
+                    marker=dict(color="#64748b", size=6, opacity=0.7),
+                )
+            )
+            if not np.isnan(tafel_slope):
+                x_fit = fit_sub["log10(|j| [mA/cm²])"]
+                y_fit = res.intercept + res.slope * x_fit
+                fig_tf.add_trace(
+                    go.Scatter(
+                        x=x_fit,
+                        y=y_fit,
+                        mode="lines",
+                        line=dict(color="#dc2626", width=3),
+                        name=f"Fit: {tafel_slope:.1f} mV/dec (R²={tafel_r2:.4f})",
+                    )
+                )
+            fig_tf.update_layout(
+                template="plotly_white",
+                xaxis_title="log₁₀(|j| / mA cm⁻²)",
+                yaxis_title="Overpotential η (mV)",
+                height=360,
+                margin=dict(l=20, r=20, t=30, b=20),
+            )
+            st.plotly_chart(fig_tf, use_container_width=True)
+
+        with tab_table:
+            st.dataframe(df_proc, use_container_width=True, height=330)
+
+    return tafel_slope, tafel_r2
+
+
+# ==========================================
+# STEP 3: LSV HER & OER PROCESSING
 # ==========================================
 def render_reaction_section(uploaded_lsv, reaction_label):
     st.divider()
     st.subheader(f"📊 {reaction_label} Overpotential & Tafel Analysis")
 
-    lsv_raw, lsv_sheets = load_uploaded_file(uploaded_lsv)
+    lsv_bytes = uploaded_lsv.getvalue()
+    lsv_sheets = get_sheet_names(lsv_bytes, uploaded_lsv.name)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if len(lsv_sheets) > 1:
             sel_sheet = st.selectbox(f"{reaction_label} Sheet", lsv_sheets, key=f"sheet_{reaction_label}")
-            lsv_raw, _ = load_uploaded_file(uploaded_lsv, sel_sheet)
         else:
-            st.text_input(f"{reaction_label} Sheet", value=lsv_sheets[0], disabled=True, key=f"sheet_{reaction_label}")
+            sel_sheet = lsv_sheets[0]
+            st.text_input(f"{reaction_label} Sheet", value=sel_sheet, disabled=True, key=f"sheet_{reaction_label}")
+
+    lsv_raw = load_dataframe(lsv_bytes, uploaded_lsv.name, sel_sheet)
+
     with c2:
         col_pot = st.selectbox(
             f"{reaction_label} Potential Column",
@@ -358,37 +467,24 @@ def render_reaction_section(uploaded_lsv, reaction_label):
         unit_flag = "mA" if curr_unit == "mA" else "A"
 
     df_proc, base_offset = process_lsv_data(
-        lsv_raw,
-        col_pot,
-        col_curr,
-        unit_flag,
-        reaction_label,
-        rhe_offset,
-        active_rs,
-        ir_factor,
-        area_cm2,
-        zero_baseline=apply_baseline,
+        lsv_raw, col_pot, col_curr, unit_flag, reaction_label,
+        rhe_offset, active_rs, ir_factor, area_cm2, zero_baseline=apply_baseline,
     )
 
-    # Calculate benchmark overpotentials (mV) at 10, 20, 30, 50, 100 mA/cm²
     benchmarks = [10, 20, 30, 50, 100]
     eta_corr_dict = {j_b: interpolate_eta_at_j(df_proc, j_b, True) for j_b in benchmarks}
     eta_raw_dict = {j_b: interpolate_eta_at_j(df_proc, j_b, False) for j_b in benchmarks}
 
-    # Diagnostic warning if capacitive pre-current / redox peak skews η10
     init_j = df_proc["|j| (mA/cm²)"].iloc[: max(3, int(len(df_proc) * 0.05))].mean()
     if init_j > 3.0 and not apply_baseline:
         st.warning(
-            f"⚠️ **Nickel Foam Capacitive / Redox Pre-Current Detected:** Initial background current density is "
-            f"`{init_j:.2f} mA/cm²`. This can artificially lower $\\eta_{{10}}$. Consider reporting "
-            f"**$\\eta_{{20}}$, $\\eta_{{30}}$, or $\\eta_{{50}}$** or toggling **Capacitive Baseline Zeroing** in the sidebar."
+            f"⚠️ **Capacitive / Redox Pre-Current Detected (`{init_j:.2f} mA/cm²`):** "
+            f"High-surface-area Nickel Foam pre-currents can artificially skew $\\eta_{{10}}$. "
+            f"Compare **$\\eta_{{20}}$, $\\eta_{{30}}$, and $\\eta_{{50}}$** below, or enable **Capacitive Baseline Zeroing** in the sidebar."
         )
     elif apply_baseline:
-        st.success(
-            f"✔️ **Baseline Zeroing Active:** Subtracted `{base_offset * 1000:.3f} mA` non-Faradaic pre-current offset."
-        )
+        st.success(f"✔️ **Baseline Zeroing Active:** Subtracted `{base_offset * 1000:.3f} mA` non-Faradaic pre-current.")
 
-    # Display Metric Cards
     m_cols = st.columns(len(benchmarks))
     for idx, j_b in enumerate(benchmarks):
         val_c = eta_corr_dict[j_b]
@@ -397,111 +493,11 @@ def render_reaction_section(uploaded_lsv, reaction_label):
             st.metric(
                 label=f"η_{j_b} ({ir_comp_pct}% iR)",
                 value=f"{val_c:.1f} mV" if not np.isnan(val_c) else "N/A",
-                delta=f"Raw: {val_r:.1f} mV" if not np.isnan(val_r) else None,
+                delta=f"Raw (0% iR): {val_r:.1f} mV" if not np.isnan(val_r) else None,
                 delta_color="off",
             )
 
-    # Interactive Tafel Slope Linear Region Selector
-    st.markdown(f"#### 📈 {reaction_label} Polarization Curve & Tafel Slope Fit")
-    valid_tafel = df_proc.dropna(subset=["log10(|j| [mA/cm²])", "Overpotential η (mV)"])
-    valid_tafel = valid_tafel[valid_tafel["Overpotential η (mV)"] > 0]
-
-    col_t1, col_t2 = st.columns([1, 2])
-    tafel_slope = np.nan
-    tafel_r2 = np.nan
-
-    with col_t1:
-        if len(valid_tafel) >= 5:
-            j_min_avail = float(max(0.5, valid_tafel["|j| (mA/cm²)"].min()))
-            j_max_avail = float(valid_tafel["|j| (mA/cm²)"].max())
-            default_low = min(max(5.0, j_min_avail), j_max_avail * 0.5)
-            default_high = min(max(30.0, default_low + 10.0), j_max_avail)
-
-            j_range = st.slider(
-                f"Select {reaction_label} Linear Current Density Window for Tafel Fit (mA/cm²)",
-                min_value=round(j_min_avail, 2),
-                max_value=round(j_max_avail, 2),
-                value=(round(default_low, 2), round(default_high, 2)),
-                key=f"tafel_slider_{reaction_label}",
-            )
-
-            fit_sub = valid_tafel[
-                (valid_tafel["|j| (mA/cm²)"] >= j_range[0])
-                & (valid_tafel["|j| (mA/cm²)"] <= j_range[1])
-            ]
-
-            if len(fit_sub) >= 3:
-                res = linregress(fit_sub["log10(|j| [mA/cm²])"], fit_sub["Overpotential η (mV)"])
-                tafel_slope = res.slope
-                tafel_r2 = res.rvalue ** 2
-                st.metric(f"{reaction_label} Tafel Slope", f"{tafel_slope:.1f} mV/dec")
-                st.write(f"**Linear Fit $R^2$:** `{tafel_r2:.5f}`")
-                st.write(f"**Points in Fit:** `{len(fit_sub)}`")
-            else:
-                st.warning("Select a wider current density window (at least 3 data points).")
-
-    with col_t2:
-        tab_lsv, tab_tafel, tab_table = st.tabs(["LSV Polarization Curve", "Tafel Plot (η vs. log|j|)", "Processed Data Table"])
-
-        with tab_lsv:
-            fig_lsv = go.Figure()
-            fig_lsv.add_trace(
-                go.Scatter(
-                    x=df_proc["E vs RHE Raw (V)"],
-                    y=df_proc["Current Density j (mA/cm²)"],
-                    mode="lines",
-                    name="Raw (0% iR)",
-                    line=dict(dash="dash"),
-                )
-            )
-            fig_lsv.add_trace(
-                go.Scatter(
-                    x=df_proc["E vs RHE iR-Corrected (V)"],
-                    y=df_proc["Current Density j (mA/cm²)"],
-                    mode="lines",
-                    name=f"{ir_comp_pct}% iR-Corrected",
-                )
-            )
-            fig_lsv.update_layout(
-                xaxis_title="Potential (V vs. RHE)",
-                yaxis_title="Current Density j (mA/cm²)",
-                height=360,
-                margin=dict(l=20, r=20, t=30, b=20),
-            )
-            st.plotly_chart(fig_lsv, use_container_width=True)
-
-        with tab_tafel:
-            fig_tf = go.Figure()
-            fig_tf.add_trace(
-                go.Scatter(
-                    x=valid_tafel["log10(|j| [mA/cm²])"],
-                    y=valid_tafel["Overpotential η (mV)"],
-                    mode="markers",
-                    name="Experimental Data",
-                )
-            )
-            if not np.isnan(tafel_slope):
-                x_fit = fit_sub["log10(|j| [mA/cm²])"]
-                y_fit = res.intercept + res.slope * x_fit
-                fig_tf.add_trace(
-                    go.Scatter(
-                        x=x_fit,
-                        y=y_fit,
-                        mode="lines",
-                        line=dict(color="red", width=3),
-                        name=f"Fit: {tafel_slope:.1f} mV/dec (R²={tafel_r2:.4f})",
-                    )
-                )
-            fig_tf.update_layout(
-                xaxis_title="log₁₀(|j| / mA cm⁻²)",
-                yaxis_title="Overpotential η (mV)",
-                height=360,
-                margin=dict(l=20, r=20, t=30, b=20),
-            )
-            st.plotly_chart(fig_tf, use_container_width=True)
-
-        with tab_table:
-            st.dataframe(df_proc, use_container_width=True, height=320)
+    tafel_slope, tafel_r2 = render_interactive_plots(df_proc, reaction_label, ir_comp_pct)
 
     summary_info = {
         "Reaction": reaction_label,
